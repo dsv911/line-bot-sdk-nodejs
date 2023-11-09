@@ -1,13 +1,9 @@
-import axios, {
-  AxiosInstance,
-  AxiosError,
-  AxiosResponse,
-  AxiosRequestConfig,
-} from "axios";
 import { Readable } from "stream";
+import type { ReadableStream } from "node:stream/web";
 import { HTTPError, ReadError, RequestError } from "./exceptions";
 import * as fileType from "file-type";
 import * as qs from "querystring";
+import * as merge from "deepmerge";
 
 const pkg = require("../package.json");
 
@@ -16,99 +12,165 @@ export interface RequestFile {
   contentType: string;
 }
 
-interface httpClientConfig extends Partial<AxiosRequestConfig> {
+interface httpClientConfig extends Partial<RequestInit> {
   baseURL?: string;
-  defaultHeaders?: any;
-  responseParser?: <T>(res: AxiosResponse) => T;
+  defaultHeaders?: HeadersInit;
+  responseParser?: <T>(res: Response) => Promise<T>;
+  onError?: (err: any) => any;
 }
 
+const wrapFetch = (config: httpClientConfig) => {
+  return (
+    url: string,
+    params?: any,
+    requestConfig?: RequestInit,
+  ): Promise<Response> =>
+    new Promise(async (resolve, reject) => {
+      const requestUrl = new URL(url, config.baseURL);
+
+      if (params && Object.keys(params).length !== 0) {
+        if (typeof params === "object") {
+          Object.entries(params).forEach(([key, value]) =>
+            requestUrl.searchParams.set(...[key, String(value)]),
+          );
+        } else {
+          requestUrl.search = params;
+        }
+      }
+
+      const promise = fetch(requestUrl, merge(requestConfig, config));
+      promise.catch(err => {
+        if (err instanceof TypeError)
+          reject(config.onError({ ...err, code: "" }));
+        if (err instanceof DOMException) reject(config.onError(err));
+      });
+      promise.then(async res => {
+        if (!res.ok)
+          return reject(
+            config.onError({
+              response: res,
+              message: await res.text(),
+            }),
+          );
+        resolve(res);
+      });
+    });
+};
+
 export default class HTTPClient {
-  private instance: AxiosInstance;
+  private fetch: (
+    url: string,
+    params?: any,
+    requestConfig?: RequestInit,
+  ) => Promise<Response>;
   private config: httpClientConfig;
 
   constructor(config: httpClientConfig = {}) {
     this.config = config;
     const { baseURL, defaultHeaders } = config;
-    this.instance = axios.create({
+    this.fetch = wrapFetch({
       baseURL,
       headers: Object.assign({}, defaultHeaders, {
         "User-Agent": `${pkg.name}/${pkg.version}`,
       }),
+      onError: err => this.wrapError(err),
     });
-
-    this.instance.interceptors.response.use(
-      res => res,
-      err => Promise.reject(this.wrapError(err)),
-    );
   }
 
   public async get<T>(url: string, params?: any): Promise<T> {
-    const res = await this.instance.get(url, { params });
-    return res.data;
+    const res = await this.fetch(url, params);
+    return await res.json();
   }
 
   public async getStream(url: string, params?: any): Promise<Readable> {
-    const res = await this.instance.get(url, {
-      params,
-      responseType: "stream",
-    });
-    return res.data as Readable;
+    const res = (await this.fetch(url, params)).body;
+    return Readable.fromWeb(res as ReadableStream<Uint8Array>);
   }
 
   public async post<T>(
     url: string,
     body?: any,
-    config?: Partial<AxiosRequestConfig>,
+    config?: Partial<RequestInit>,
   ): Promise<T> {
-    const res = await this.instance.post(url, body, {
-      headers: {
-        "Content-Type": "application/json",
-        ...(config && config.headers),
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: body instanceof Object ? JSON.stringify(body) : body,
+        ...config,
       },
-      ...config,
-    });
+    );
 
-    return this.responseParse(res);
+    return await this.responseParse(res);
   }
 
-  private responseParse(res: AxiosResponse) {
+  private async responseParse(res: Response) {
     const { responseParser } = this.config;
-    if (responseParser) return responseParser(res);
-    else return res.data;
+    if (responseParser) return await responseParser(res);
+    else return await res.json();
   }
 
   public async put<T>(
     url: string,
     body?: any,
-    config?: Partial<AxiosRequestConfig>,
+    config?: Partial<RequestInit>,
   ): Promise<T> {
-    const res = await this.instance.put<T>(url, body, {
-      headers: {
-        "Content-Type": "application/json",
-        ...(config && config.headers),
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: body instanceof Object ? JSON.stringify(body) : body,
+        ...config,
       },
-      ...config,
-    });
+    );
 
-    return this.responseParse(res);
+    return await this.responseParse(res);
   }
 
   public async postForm<T>(url: string, body?: any): Promise<T> {
-    const res = await this.instance.post(url, qs.stringify(body), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "POST",
+        body: qs.stringify(body),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      },
+    );
 
-    return res.data;
+    return await res.json();
   }
 
   public async postFormMultipart<T>(url: string, form: FormData): Promise<T> {
-    const res = await this.instance.post<T>(url, form);
-    return res.data;
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "POST",
+        body: form,
+      },
+    );
+    return await res.json();
   }
 
   public async putFormMultipart<T>(url: string, form: FormData): Promise<T> {
-    const res = await this.instance.put<T>(url, form);
-    return res.data;
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "PUT",
+        body: form,
+      },
+    );
+    return await res.json();
   }
 
   public async toBuffer(data: Buffer | Readable) {
@@ -137,33 +199,46 @@ export default class HTTPClient {
   ): Promise<T> {
     const buffer = await this.toBuffer(data);
 
-    const res = await this.instance.post(url, buffer, {
-      headers: {
-        "Content-Type": contentType || (await fileType.fromBuffer(buffer)).mime,
-        "Content-Length": buffer.length,
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "POST",
+        body: buffer,
+        headers: {
+          "Content-Type":
+            contentType || (await fileType.fromBuffer(buffer)).mime,
+          "Content-Length": buffer.length.toString(),
+        },
       },
-    });
+    );
 
-    return res.data;
+    return await res.json();
   }
 
   public async postBinaryContent<T>(url: string, body: Blob): Promise<T> {
-    const res = await this.instance.post(url, body, {
-      headers: {
-        "Content-Type": body.type,
-        "Content-Length": body.size,
+    const res = await this.fetch(
+      url,
+      {},
+      {
+        method: "POST",
+        body,
+        headers: {
+          "Content-Type": body.type,
+          "Content-Length": body.size.toString(),
+        },
       },
-    });
+    );
 
-    return res.data;
+    return await res.json();
   }
 
   public async delete<T>(url: string, params?: any): Promise<T> {
-    const res = await this.instance.delete(url, { params });
-    return res.data;
+    const res = await this.fetch(url, params, { method: "DELETE" });
+    return await res.json();
   }
 
-  private wrapError(err: AxiosError): Error {
+  private wrapError(err: any): Error {
     if (err.response) {
       return new HTTPError(
         err.message,
@@ -173,8 +248,7 @@ export default class HTTPClient {
       );
     } else if (err.code) {
       return new RequestError(err.message, err.code, err);
-    } else if (err.config) {
-      // unknown, but from axios
+    } else if (err.name === "AbortError") {
       return new ReadError(err);
     }
 
